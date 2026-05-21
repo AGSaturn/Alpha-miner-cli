@@ -1,0 +1,19 @@
+[project]
+name = "alpha-miner-cli"
+version = "1.0.0"
+description = "CLI for QuantGPT factor research — backtest, score, diagnose, and WQ BRAIN integration"
+requires-python = ">=3.10"
+dependencies = [
+    "quantgpt>=2.5.0",
+    "pandas>=2.0",
+]
+
+[project.scripts]
+alpha-miner = "alpha_miner_cli.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["alpha_miner_cli*"]
