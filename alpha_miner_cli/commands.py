@@ -408,21 +408,13 @@ async def cmd_rolling(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
-# WQ BRAIN commands
+# WQ BRAIN commands (refactored to use wq_brain_service)
 # ---------------------------------------------------------------------------
-
-
-def _safe_float(val: object) -> float | None:
-    if val is None:
-        return None
-    try:
-        return float(val)
-    except (TypeError, ValueError):
-        return None
 
 
 async def cmd_wq_submit(args: argparse.Namespace) -> None:
     from quantgpt.wq_brain_client import WQBrainClient, is_configured
+    from quantgpt.wq_brain_service import run_single_simulation
 
     if not is_configured():
         _die("WQ BRAIN 未配置 — 请设置 WQ_BRAIN_EMAIL 和 WQ_BRAIN_PASSWORD")
@@ -434,61 +426,18 @@ async def cmd_wq_submit(args: argparse.Namespace) -> None:
             _die("WQ BRAIN 认证失败")
 
         result = await asyncio.to_thread(
-            client.simulate,
-            args.expression, region=args.region, universe=args.wq_universe,
+            run_single_simulation,
+            client, args.expression,
+            region=args.region, universe=args.wq_universe,
             delay=args.delay, decay=args.decay, neutralization=args.neutral,
-            truncation=args.truncation,
+            truncation=args.truncation, auto_submit=args.auto_submit,
         )
+        await asyncio.to_thread(client.close)
 
         if not result.get("ok"):
             _die(result.get("error", "Simulation failed"))
 
-        alpha_id = result.get("alpha_id")
-        is_data = result.get("is", {})
-        fitness = _safe_float(is_data.get("fitness"))
-
-        if fitness is not None and fitness >= 1.0:
-            rating = "A"
-        elif fitness is not None and fitness >= 0.5:
-            rating = "B"
-        elif fitness is not None and fitness >= 0.25:
-            rating = "C"
-        else:
-            rating = "D"
-
-        submitted = False
-        if args.auto_submit and alpha_id and rating == "A":
-            submit_result = await asyncio.to_thread(client.submit_alpha, alpha_id)
-            submitted = submit_result.get("ok", False)
-
-        sharpe = _safe_float(is_data.get("sharpe"))
-        returns_val = _safe_float(is_data.get("returns"))
-        turnover = _safe_float(is_data.get("turnover"))
-
-        await asyncio.to_thread(client.close)
-
-        _print_json({
-            "expression": args.expression,
-            "alpha_id": alpha_id,
-            "is_metrics": is_data,
-            "oos_metrics": result.get("oos", {}),
-            "settings": result.get("settings", {}),
-            "submitted": submitted,
-            "simulation_id": result.get("simulation_id"),
-            "backtest_summary": {
-                "long_short_sharpe": sharpe,
-                "wq_fitness": fitness,
-                "wq_rating": rating,
-            },
-            "wq_brain": {
-                "wq_sharpe": sharpe,
-                "wq_fitness": fitness,
-                "wq_returns": returns_val,
-                "wq_turnover": turnover,
-                "wq_rating": rating,
-            },
-            "interpretation": {"rating": rating},
-        })
+        _print_json(result)
 
     except Exception as e:
         logger.error("WQ BRAIN submit failed: %s", traceback.format_exc())
@@ -496,9 +445,8 @@ async def cmd_wq_submit(args: argparse.Namespace) -> None:
 
 
 async def cmd_wq_batch(args: argparse.Namespace) -> None:
-    import itertools
-
     from quantgpt.wq_brain_client import WQBrainClient, is_configured
+    from quantgpt.wq_brain_service import run_batch_simulation
 
     if not is_configured():
         _die("WQ BRAIN 未配置 — 请设置 WQ_BRAIN_EMAIL 和 WQ_BRAIN_PASSWORD")
@@ -508,94 +456,25 @@ async def cmd_wq_batch(args: argparse.Namespace) -> None:
     universes = args.wq_universes or ["TOP3000"]
     neutralizations = args.neutrals or ["SUBINDUSTRY"]
 
-    combos = list(itertools.product(regions, delays, universes, neutralizations))
-    if len(combos) > 36:
-        _die(f"组合数 {len(combos)} 超过上限 36")
-
     try:
         client = WQBrainClient()
         authenticated = await asyncio.to_thread(client.authenticate)
         if not authenticated:
             _die("WQ BRAIN 认证失败")
 
-        best_fitness = -999.0
-        best_key: str | None = None
-        submittable_count = 0
-        sub_results: dict = {}
-
-        for region, delay, universe, neut in combos:
-            key = f"{region}_D{delay}_{universe}_{neut}"
-            result = await asyncio.to_thread(
-                client.simulate,
-                args.expression, region=region, universe=universe,
-                delay=delay, decay=args.decay, neutralization=neut,
-                truncation=args.truncation,
-            )
-
-            sub: dict = {"key": key, "region": region, "delay": delay, "universe": universe, "neutralization": neut}
-
-            if not result.get("ok"):
-                sub["status"] = "failed"
-                sub["error"] = result.get("error", "unknown")
-            else:
-                alpha_id = result.get("alpha_id")
-                is_data = result.get("is", {})
-                submitted = False
-                if args.auto_submit and alpha_id:
-                    submit_result = await asyncio.to_thread(client.submit_alpha, alpha_id)
-                    submitted = submit_result.get("ok", False)
-
-                fitness = _safe_float(is_data.get("fitness"))
-                sub["status"] = "completed"
-                sub["alpha_id"] = alpha_id
-                sub["sharpe"] = _safe_float(is_data.get("sharpe"))
-                sub["fitness"] = fitness
-                sub["returns"] = _safe_float(is_data.get("returns"))
-                sub["turnover"] = _safe_float(is_data.get("turnover"))
-                sub["submitted"] = submitted
-
-                if fitness is not None and fitness >= 1.0:
-                    submittable_count += 1
-                if fitness is not None and fitness > best_fitness:
-                    best_fitness = fitness
-                    best_key = key
-
-            sub_results[key] = sub
-
+        result = await asyncio.to_thread(
+            run_batch_simulation,
+            client, args.expression,
+            regions=regions, delays=delays, universes=universes,
+            neutralizations=neutralizations, decay=args.decay,
+            truncation=args.truncation, auto_submit=args.auto_submit,
+        )
         await asyncio.to_thread(client.close)
 
-        best_sub = sub_results.get(best_key, {}) if best_key else {}
-        best_fit = round(best_fitness, 4) if best_fitness > -999 else None
-        if best_fit is not None and best_fit >= 1.0:
-            best_rating = "A"
-        elif best_fit is not None and best_fit >= 0.5:
-            best_rating = "B"
-        elif best_fit is not None and best_fit >= 0.25:
-            best_rating = "C"
-        else:
-            best_rating = "D"
+        if not result.get("ok"):
+            _die(result.get("error", "All simulations failed"))
 
-        _print_json({
-            "expression": args.expression,
-            "total_combinations": len(combos),
-            "best_fitness": best_fit,
-            "best_key": best_key,
-            "submittable_count": submittable_count,
-            "sub_results": sub_results,
-            "backtest_summary": {
-                "long_short_sharpe": best_sub.get("sharpe"),
-                "wq_fitness": best_fit,
-                "wq_rating": best_rating,
-            },
-            "wq_brain": {
-                "wq_sharpe": best_sub.get("sharpe"),
-                "wq_fitness": best_fit,
-                "wq_returns": best_sub.get("returns"),
-                "wq_turnover": best_sub.get("turnover"),
-                "wq_rating": best_rating,
-            },
-            "interpretation": {"rating": best_rating},
-        })
+        _print_json(result)
 
     except Exception as e:
         logger.error("WQ BRAIN batch failed: %s", traceback.format_exc())
@@ -604,6 +483,7 @@ async def cmd_wq_batch(args: argparse.Namespace) -> None:
 
 async def cmd_wq_submit_ids(args: argparse.Namespace) -> None:
     from quantgpt.wq_brain_client import WQBrainClient, is_configured
+    from quantgpt.wq_brain_service import run_submit_by_ids
 
     if not is_configured():
         _die("WQ BRAIN 未配置")
@@ -618,38 +498,9 @@ async def cmd_wq_submit_ids(args: argparse.Namespace) -> None:
         if not authenticated:
             _die("WQ BRAIN 认证失败")
 
-        results = {}
-        active = sc_fail = timeout = 0
-
-        for alpha_id in alpha_ids:
-            result = await asyncio.to_thread(client.submit_alpha, alpha_id)
-            entry = {
-                "ok": result.get("ok", False),
-                "detail": result.get("detail", ""),
-                "platform_status": result.get("platform_status", ""),
-            }
-            if result.get("sc_value") is not None:
-                entry["sc_value"] = result["sc_value"]
-                entry["sc_limit"] = result.get("sc_limit")
-
-            if result.get("ok"):
-                active += 1
-            elif "SC FAIL" in result.get("detail", ""):
-                sc_fail += 1
-            elif result.get("platform_status") == "TIMEOUT":
-                timeout += 1
-
-            results[alpha_id] = entry
-
+        result = await asyncio.to_thread(run_submit_by_ids, client, alpha_ids)
         await asyncio.to_thread(client.close)
-
-        _print_json({
-            "total": len(alpha_ids),
-            "active": active,
-            "sc_fail": sc_fail,
-            "timeout": timeout,
-            "results": results,
-        })
+        _print_json(result)
 
     except Exception as e:
         logger.error("WQ submit-by-ids failed: %s", traceback.format_exc())
@@ -658,6 +509,7 @@ async def cmd_wq_submit_ids(args: argparse.Namespace) -> None:
 
 async def cmd_wq_list(args: argparse.Namespace) -> None:
     from quantgpt.wq_brain_client import WQBrainClient, is_configured
+    from quantgpt.wq_brain_service import run_list_alphas
 
     if not is_configured():
         _die("WQ BRAIN 未配置")
@@ -668,47 +520,17 @@ async def cmd_wq_list(args: argparse.Namespace) -> None:
         if not authenticated:
             _die("WQ BRAIN 认证失败")
 
-        s = client._get_session()
-        r = await asyncio.to_thread(
-            s.get,
-            "https://api.worldquantbrain.com/users/self/alphas",
-            params={"limit": min(args.limit, 100), "offset": args.offset, "order": "-dateCreated"},
+        result = await asyncio.to_thread(
+            run_list_alphas, client,
+            limit=args.limit, offset=args.offset,
+            min_fitness=args.min_fitness, status_filter=args.status_filter,
         )
         await asyncio.to_thread(client.close)
 
-        if r.status_code != 200:
-            _die(f"HTTP {r.status_code}: {r.text[:300]}")
+        if not result.get("ok"):
+            _die(result.get("error", "List alphas failed"))
 
-        data = r.json()
-        raw_alphas = data if isinstance(data, list) else data.get("results", [])
-
-        alphas = []
-        for a in raw_alphas:
-            code = a.get("regular", {})
-            expr = code.get("code", "") if isinstance(code, dict) else str(code)
-            is_data = a.get("is", {})
-
-            fitness = _safe_float(is_data.get("fitness"))
-            alpha_status = a.get("status", "")
-
-            if args.min_fitness is not None and (fitness is None or fitness < args.min_fitness):
-                continue
-            if args.status_filter and alpha_status.upper() != args.status_filter.upper():
-                continue
-
-            alphas.append({
-                "alpha_id": a.get("id"),
-                "expression": expr,
-                "status": alpha_status,
-                "dateCreated": a.get("dateCreated"),
-                "neutralization": a.get("settings", {}).get("neutralization"),
-                "sharpe": is_data.get("sharpe"),
-                "fitness": fitness,
-                "returns": is_data.get("returns"),
-                "turnover": is_data.get("turnover"),
-            })
-
-        _print_json({"total": len(alphas), "alphas": alphas})
+        _print_json(result)
 
     except Exception as e:
         logger.error("WQ list failed: %s", traceback.format_exc())
@@ -717,6 +539,7 @@ async def cmd_wq_list(args: argparse.Namespace) -> None:
 
 async def cmd_wq_check(args: argparse.Namespace) -> None:
     from quantgpt.wq_brain_client import WQBrainClient, is_configured
+    from quantgpt.wq_brain_service import run_check_alphas
 
     if not is_configured():
         _die("WQ BRAIN 未配置")
@@ -731,39 +554,9 @@ async def cmd_wq_check(args: argparse.Namespace) -> None:
         if not authenticated:
             _die("WQ BRAIN 认证失败")
 
-        results = {}
-        for alpha_id in alpha_ids:
-            data = await asyncio.to_thread(client.check_alpha_status, alpha_id)
-            if not data.get("ok"):
-                results[alpha_id] = {"ok": False, "error": data.get("error", "not found")}
-                continue
-
-            is_data = data.get("is", {})
-            checks = is_data.get("checks", [])
-            sc_check = next((c for c in checks if c.get("name") == "SELF_CORRELATION"), None)
-
-            results[alpha_id] = {
-                "ok": True,
-                "status": data.get("status"),
-                "grade": data.get("grade"),
-                "sharpe": _safe_float(is_data.get("sharpe")),
-                "fitness": _safe_float(is_data.get("fitness")),
-                "returns": _safe_float(is_data.get("returns")),
-                "turnover": _safe_float(is_data.get("turnover")),
-                "sc_result": sc_check.get("result") if sc_check else None,
-                "sc_value": sc_check.get("value") if sc_check else None,
-            }
-
+        result = await asyncio.to_thread(run_check_alphas, client, alpha_ids)
         await asyncio.to_thread(client.close)
-
-        summary = {
-            "total": len(alpha_ids),
-            "active": sum(1 for r in results.values() if r.get("status") == "ACTIVE"),
-            "unsubmitted": sum(1 for r in results.values() if r.get("status") == "UNSUBMITTED"),
-            "sc_fail": sum(1 for r in results.values() if r.get("sc_result") == "FAIL"),
-            "sc_pending": sum(1 for r in results.values() if r.get("sc_result") == "PENDING"),
-        }
-        _print_json({"summary": summary, "alphas": results})
+        _print_json(result)
 
     except Exception as e:
         logger.error("WQ check failed: %s", traceback.format_exc())
@@ -793,4 +586,195 @@ async def cmd_wq_finalize(args: argparse.Namespace) -> None:
 
     except Exception as e:
         logger.error("WQ finalize failed: %s", traceback.format_exc())
+        _die(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Compute factor values (new)
+# ---------------------------------------------------------------------------
+
+
+async def cmd_compute_factor_values(args: argparse.Namespace) -> None:
+    """Compute cross-sectional factor values for each trading day."""
+    import numpy as np
+    from datetime import date, timedelta
+
+    from quantgpt.backtest import api_context
+    from quantgpt.expression_parser import parse_expression
+    from quantgpt.market_data import MarketDataFetcher, get_universe
+
+    expression: str = args.expression
+    universe: str = args.universe
+    start_date: str = args.start or ""
+    end_date: str = args.end or ""
+
+    try:
+        factor_fn = parse_expression(expression)
+    except Exception as e:
+        _die(f"Invalid expression: {e}")
+
+    def _compute():
+        with api_context():
+            fetcher = MarketDataFetcher()
+            stocks = get_universe(universe)
+            if not stocks:
+                return {"error": f"Empty universe: {universe}"}
+
+            end_dt = end_date or date.today().isoformat()
+            if not start_date:
+                start_dt = (date.fromisoformat(end_dt) - timedelta(days=365)).isoformat()
+            else:
+                start_dt = start_date
+
+            d_start = date.fromisoformat(start_dt)
+            d_end = date.fromisoformat(end_dt)
+            if (d_end - d_start).days > 750:
+                return {"error": "Date range too large (max 750 days)"}
+
+            extra_days = 260
+            fetch_start = (d_start - timedelta(days=extra_days)).isoformat()
+
+            df = fetcher.fetch_stocks(stocks, fetch_start, end_dt)
+            if df is None or df.empty:
+                return {"error": "No market data available for this universe/date range"}
+
+            try:
+                factor_values = factor_fn(df)
+            except Exception as e:
+                return {"error": f"Expression evaluation failed: {e}"}
+
+            df["factor_value"] = factor_values
+            result_df = df[df["trade_date"] >= start_dt][["trade_date", "stock_code", "factor_value"]].copy()
+            result_df = result_df.dropna(subset=["factor_value"])
+
+            dates_data = []
+            for trade_date, group in result_df.groupby("trade_date"):
+                values = {}
+                for _, row in group.iterrows():
+                    val = row["factor_value"]
+                    if np.isfinite(val):
+                        values[row["stock_code"]] = round(float(val), 6)
+                if values:
+                    dates_data.append({
+                        "date": str(trade_date),
+                        "values": values,
+                        "count": len(values),
+                    })
+
+            return {
+                "expression": expression,
+                "universe": universe,
+                "start_date": start_dt,
+                "end_date": end_dt,
+                "trading_days": len(dates_data),
+                "data": dates_data,
+            }
+
+    result = await asyncio.to_thread(_compute)
+    _print_json(result)
+
+
+# ---------------------------------------------------------------------------
+# Adversarial validation (new)
+# ---------------------------------------------------------------------------
+
+
+async def cmd_adversarial(args: argparse.Namespace) -> None:
+    from quantgpt.adversarial_validator import run_adversarial_validation
+
+    expression: str = args.expression
+    universe: str = args.universe
+    start_date: str = args.start
+    end_date: str = args.end
+    holding_period: int = args.holding
+    neutralize_industry: bool = not args.no_neutralize_industry
+    neutralize_cap: bool = not args.no_neutralize_cap
+
+    try:
+        market_df, stock_codes = await asyncio.to_thread(_fetch_data_for_market, universe, start_date, end_date)
+        if market_df is None or len(market_df) == 0:
+            _die("No market data available.")
+
+        market_df = await asyncio.to_thread(
+            _enrich_with_fundamentals, expression, market_df, stock_codes, start_date, end_date
+        )
+
+        executor = get_executor()
+        future = executor.submit_cpu_work(
+            _run_backtest_in_process, market_df, expression,
+            holding_period=holding_period, cost_rate=0,
+            neutralize_industry=neutralize_industry, neutralize_cap=neutralize_cap,
+        )
+        result = await asyncio.to_thread(future.result, 600)
+        factor_df = result.get("_factor_df")
+        if factor_df is None or len(factor_df) < 100:
+            _die("Insufficient factor data for adversarial validation.")
+
+        adv_result = await asyncio.to_thread(run_adversarial_validation, factor_df, holding_period)
+        _print_json(adv_result)
+
+    except Exception as e:
+        logger.error("Adversarial validation failed: %s", traceback.format_exc())
+        _die(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Cloud upload (new)
+# ---------------------------------------------------------------------------
+
+
+async def cmd_cloud_upload(args: argparse.Namespace) -> None:
+    from quantgpt.cloud_client import CloudClient, is_configured
+
+    if not is_configured():
+        _die("Cloud 未配置 — 请设置 QUANTGPT_CLOUD_EMAIL 和 QUANTGPT_CLOUD_PASSWORD")
+
+    expression: str = args.expression
+    universe: str = args.universe
+    start_date: str = args.start
+    end_date: str = args.end
+    holding_period: int = args.holding
+    neutralize_industry: bool = not args.no_neutralize_industry
+    neutralize_cap: bool = not args.no_neutralize_cap
+
+    try:
+        market_df, stock_codes = await asyncio.to_thread(_fetch_data_for_market, universe, start_date, end_date)
+        if market_df is None or len(market_df) == 0:
+            _die("No market data available.")
+
+        market_df = await asyncio.to_thread(
+            _enrich_with_fundamentals, expression, market_df, stock_codes, start_date, end_date
+        )
+
+        executor = get_executor()
+        future = executor.submit_cpu_work(
+            _run_backtest_in_process, market_df, expression,
+            holding_period=holding_period, cost_rate=0,
+            neutralize_industry=neutralize_industry, neutralize_cap=neutralize_cap,
+        )
+        result = await asyncio.to_thread(future.result, 600)
+        factor_df = result.get("_factor_df")
+        if factor_df is None or len(factor_df) < 30:
+            _die("Insufficient factor data for cloud upload (min 30 trading days).")
+
+        from quantgpt.cloud_client import factor_df_to_cloud_format
+
+        data = await asyncio.to_thread(factor_df_to_cloud_format, factor_df)
+        if len(data) < 30:
+            _die(f"Only {len(data)} trading days in factor data (min 30).")
+
+        client = CloudClient()
+        upload_result = await asyncio.to_thread(
+            client.upload_and_validate,
+            name=args.name or expression[:80],
+            universe=universe,
+            factor_values_data=data,
+            expression=expression,
+            claimed_ic_mean=result.get("ic_mean"),
+            claimed_ic_ir=result.get("ic_ir"),
+        )
+        _print_json(upload_result)
+
+    except Exception as e:
+        logger.error("Cloud upload failed: %s", traceback.format_exc())
         _die(str(e))

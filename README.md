@@ -90,6 +90,41 @@ alpha-miner rolling --expression "rank(close/ts_mean(close,20))" --universe hs30
 
 Walk-Forward 滚动窗口，评估样本外衰减。
 
+### 因子截面值计算
+
+```bash
+alpha-miner compute-factor-values \
+  --expression "rank(ts_mean(close/open, 10))" \
+  --universe csi500 \
+  --start 2025-01-01 \
+  --end 2025-05-01
+```
+
+返回每个交易日所有股票的因子得分，用于下游组合构建或外部分析。输出 `{trading_days, data: [{date, values: {symbol: score}}]}`。
+
+### 对抗性验证
+
+```bash
+alpha-miner adversarial --expression "rank(close/ts_mean(close,20))" --universe small_scale
+```
+
+4 项破坏性测试: 标签置换、时序打乱、随机股票池、噪声注入。比 `anti-overfit` 更严格地检测虚假因子。
+
+### Cloud 上传
+
+```bash
+alpha-miner cloud-upload \
+  --expression "rank(close/ts_mean(close,20))" \
+  --universe hs300 \
+  --name "my-factor-v1"
+```
+
+上传因子截面值到 QuantGPT Cloud 进行独立验证和公开追溯。需要配置:
+```
+QUANTGPT_CLOUD_EMAIL=your_email
+QUANTGPT_CLOUD_PASSWORD=your_password
+```
+
 ### WQ BRAIN 模拟
 
 ```bash

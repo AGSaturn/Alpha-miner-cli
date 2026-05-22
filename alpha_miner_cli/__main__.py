@@ -136,6 +136,22 @@ def _build_parser() -> argparse.ArgumentParser:
     p_wqf = sub.add_parser("wq-finalize", help="查询已提交 alpha 的最终 SC 检查结果")
     p_wqf.add_argument("--ids", nargs="+", required=True, help="alpha_id 列表 (最多 100)")
 
+    # ---- compute-factor-values ----
+    p_cfv = sub.add_parser("compute-factor-values", help="计算因子每日截面值")
+    p_cfv.add_argument("--expression", required=True, help="因子表达式")
+    p_cfv.add_argument("--universe", default="csi500", help="股票池 (hs300/csi500/csi1000/csi2000)")
+    p_cfv.add_argument("--start", default="", help="起始日期 (默认 end 前 365 天)")
+    p_cfv.add_argument("--end", default="", help="截止日期 (默认今天)")
+
+    # ---- adversarial ----
+    p_adv = sub.add_parser("adversarial", help="对因子执行对抗性验证 (4项破坏性测试)")
+    _add_backtest_args(p_adv)
+
+    # ---- cloud-upload ----
+    p_cloud = sub.add_parser("cloud-upload", help="上传因子值到 QuantGPT Cloud 进行独立验证")
+    _add_backtest_args(p_cloud)
+    p_cloud.add_argument("--name", default=None, help="云端因子名称 (默认使用表达式)")
+
     # ---- serve (legacy) ----
     p_serve = sub.add_parser("serve", help="启动 QuantGPT 服务器")
     p_serve.add_argument("--transport", choices=["stdio", "sse", "streamable-http", "http"], default="stdio")
@@ -221,6 +237,9 @@ def main():
         "wq-list": commands.cmd_wq_list,
         "wq-check": commands.cmd_wq_check,
         "wq-finalize": commands.cmd_wq_finalize,
+        "compute-factor-values": commands.cmd_compute_factor_values,
+        "adversarial": commands.cmd_adversarial,
+        "cloud-upload": commands.cmd_cloud_upload,
     }
 
     fn = dispatch.get(cmd)
